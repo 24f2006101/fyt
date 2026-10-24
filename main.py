@@ -8,7 +8,32 @@ from state import handle_receipt
 app = FastAPI()
 
 store = UpstashStore()
+import logging
+import traceback
 
+from fastapi.responses import JSONResponse
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+logger = logging.getLogger("incident-agent")
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):
+    logger.error(
+        "Unhandled error on %s: %s\n%s",
+        request.url.path,
+        repr(exc),
+        traceback.format_exc()
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
 
 @app.post("/v2/incidents")
 async def create_incident(
