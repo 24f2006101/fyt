@@ -6,7 +6,11 @@ from trace import build_otlp
 
 
 def handle_receipt(store, run_id, receipt):
-    run = store.runs[run_id]
+    run = store.get_run(run_id)
+
+    if run is None:
+        raise ValueError("Unknown run")
+
     outcomes = receipt.get("outcomes", [])
     approvals = receipt.get("approvals", [])
 
@@ -15,44 +19,44 @@ def handle_receipt(store, run_id, receipt):
             if dispatch["actionId"] != outcome["actionId"]:
                 continue
 
-            # Do not process the same logical attempt twice.
+            # Ignore duplicate processing of the same logical attempt.
             if "receipt" in dispatch:
                 continue
 
             dispatch["receipt"] = outcome
             dispatch["receiptId"] = receipt["receiptId"]
 
-            # Diagnostic succeeded -> propose exactly one effect.
+            # Diagnostic succeeded: propose exactly one effect.
             if (
                 dispatch["phase"] == "diagnostic"
                 and outcome.get("resultClass") == "diagnosis_confirmed"
                 and outcome.get("status") == 200
             ):
-                return propose_effect(run, receipt)
+                return propose_effect(store, run, receipt)
 
-            # 503 diagnostic -> exactly one retry.
+            # Diagnostic returned 503: allow exactly one retry.
             if (
                 dispatch["phase"] == "diagnostic"
                 and outcome.get("status") == 503
                 and dispatch["attempt"] == 1
             ):
-                return retry_dispatch(run, dispatch)
+                return retry_dispatch(store, run, dispatch, receipt)
 
-            # Effect succeeded -> run is complete.
+            # Effect succeeded: finish the run.
             if (
                 dispatch["phase"] == "effect"
                 and outcome.get("status") == 200
             ):
-                return finish_run(run, receipt)
+                return finish_run(store, run, receipt)
 
     for approval in approvals:
         if approval.get("decision") == "approved":
-            return dispatch_approved_effect(run, approval, receipt)
+            return dispatch_approved_effect(store, run, approval, receipt)
 
     return run["last_response"]
 
 
-def retry_dispatch(run, dispatch):
+def retry_dispatch(store, run, dispatch, receipt):
     parts = dispatch["traceparent"].split("-")
     trace_id = parts[1]
     new_client_span_id = secrets.token_hex(8)
@@ -61,10 +65,11 @@ def retry_dispatch(run, dispatch):
     retry["attempt"] = 2
     retry["traceparent"] = f"00-{trace_id}-{new_client_span_id}-01"
     retry.pop("receipt", None)
+    retry.pop("receiptId", None)
 
     run["dispatches"].append(retry)
 
-    return {
+    response = {
         "runId": run["request"]["runId"],
         "status": "waiting",
         "diagnosis": run["last_response"]["diagnosis"],
@@ -72,14 +77,18 @@ def retry_dispatch(run, dispatch):
         "approvals": []
     }
 
+    store.save_response(run["request"]["runId"], response)
+    return response
 
-def propose_effect(run, receipt):
+
+def propose_effect(store, run, receipt):
     policy = run["request"]["policy"]
     effect_tool = policy["effectTools"][0]
     diagnosis = run["last_response"]["diagnosis"]
 
     if effect_tool in policy.get("approvalRequiredFor", []):
         arguments = {"reason": "confirmed incident"}
+
         approval = {
             "approvalId": "approval_" + secrets.token_hex(8),
             "actionId": "effect_" + secrets.token_hex(8),
@@ -89,13 +98,16 @@ def propose_effect(run, receipt):
 
         run["approvals"] = [approval]
 
-        return {
+        response = {
             "runId": run["request"]["runId"],
             "status": "waiting",
             "diagnosis": diagnosis,
             "dispatches": [],
             "approvals": [approval]
         }
+
+        store.save_response(run["request"]["runId"], response)
+        return response
 
     effect = {
         "actionId": "effect_" + secrets.token_hex(8),
@@ -110,7 +122,7 @@ def propose_effect(run, receipt):
 
     run["dispatches"].append(effect)
 
-    return {
+    response = {
         "runId": run["request"]["runId"],
         "status": "waiting",
         "diagnosis": diagnosis,
@@ -118,8 +130,11 @@ def propose_effect(run, receipt):
         "approvals": []
     }
 
+    store.save_response(run["request"]["runId"], response)
+    return response
 
-def dispatch_approved_effect(run, approval, receipt):
+
+def dispatch_approved_effect(store, run, approval, receipt):
     diagnosis = run["last_response"]["diagnosis"]
 
     effect = {
@@ -137,7 +152,7 @@ def dispatch_approved_effect(run, approval, receipt):
 
     run["dispatches"].append(effect)
 
-    return {
+    response = {
         "runId": run["request"]["runId"],
         "status": "waiting",
         "diagnosis": diagnosis,
@@ -145,8 +160,11 @@ def dispatch_approved_effect(run, approval, receipt):
         "approvals": []
     }
 
+    store.save_response(run["request"]["runId"], response)
+    return response
 
-def finish_run(run, receipt):
+
+def finish_run(store, run, receipt):
     action_log = []
     receipt_log = []
 
@@ -166,7 +184,7 @@ def finish_run(run, receipt):
                 "nonce": outcome["nonce"]
             })
 
-    return {
+    response = {
         "runId": run["request"]["runId"],
         "status": "completed",
         "diagnosis": run["last_response"]["diagnosis"],
@@ -176,6 +194,9 @@ def finish_run(run, receipt):
         "receiptLog": receipt_log,
         "otlp": build_otlp(run)
     }
+
+    store.save_response(run["request"]["runId"], response)
+    return response
 
 
 def sha256_json(value):
