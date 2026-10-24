@@ -4,13 +4,17 @@ import re
 import secrets
 
 from dotenv import load_dotenv
+
 from openai import OpenAI
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1"
+)
 
-MODEL_NAME = "gpt-4o-mini"
+MODEL_NAME = "llama-3.3-70b-versatile"
 
 
 def extract_evidence_ids(transcript):
