@@ -2,3 +2,5 @@ fastapi[standard]
 uvicorn
 httpx
 upstash-redis
+openai
+python-dotenv
