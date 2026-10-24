@@ -1,219 +1,206 @@
-import hashlib
 import json
+import os
+import re
 import secrets
 
-from trace import build_otlp
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+MODEL_NAME = "gpt-4o-mini"
 
 
-def handle_receipt(store, run_id, receipt):
-    run = store.get_run(run_id)
-
-    if run is None:
-        raise ValueError("Unknown run")
-
-    outcomes = receipt.get("outcomes", [])
-    approvals = receipt.get("approvals", [])
-
-    for outcome in outcomes:
-        for dispatch in run["dispatches"]:
-            if dispatch["actionId"] != outcome["actionId"]:
-                continue
-
-            # Ignore duplicate processing of the same logical attempt.
-            if "receipt" in dispatch:
-                continue
-
-            dispatch["receipt"] = outcome
-            dispatch["receiptId"] = receipt["receiptId"]
-
-            # Diagnostic succeeded: propose exactly one effect.
-            if (
-                dispatch["phase"] == "diagnostic"
-                and outcome.get("resultClass") == "diagnosis_confirmed"
-                and outcome.get("status") == 200
-            ):
-                return propose_effect(store, run, receipt)
-
-            # Diagnostic returned 503: allow exactly one retry.
-            if (
-                dispatch["phase"] == "diagnostic"
-                and outcome.get("status") == 503
-                and dispatch["attempt"] == 1
-            ):
-                return retry_dispatch(store, run, dispatch, receipt)
-
-            # Effect succeeded: finish the run.
-            if (
-                dispatch["phase"] == "effect"
-                and outcome.get("status") == 200
-            ):
-                return finish_run(store, run, receipt)
-
-    for approval in approvals:
-        if approval.get("decision") == "approved":
-            return dispatch_approved_effect(store, run, approval, receipt)
-
-    return run["last_response"]
+def extract_evidence_ids(transcript):
+    # Accept any bracketed evidence ID, not only ev_...
+    return re.findall(r"\[([A-Za-z0-9_\-]+)\]", transcript)
 
 
-def retry_dispatch(store, run, dispatch, receipt):
-    parts = dispatch["traceparent"].split("-")
-    trace_id = parts[1]
-    new_client_span_id = secrets.token_hex(8)
+def build_required_arguments(tool, transcript):
+    schema = tool.get("inputSchema", {})
+    required = schema.get("required", [])
+    properties = schema.get("properties", {})
 
-    retry = dict(dispatch)
-    retry["attempt"] = 2
-    retry["traceparent"] = f"00-{trace_id}-{new_client_span_id}-01"
-    retry.pop("receipt", None)
-    retry.pop("receiptId", None)
+    prompt = f"""
+Fill the required arguments for this diagnostic tool using only facts from the incident transcript.
 
-    run["dispatches"].append(retry)
+Tool name:
+{tool["name"]}
 
-    response = {
-        "runId": run["request"]["runId"],
-        "status": "waiting",
-        "diagnosis": run["last_response"]["diagnosis"],
-        "dispatches": [retry],
-        "approvals": []
-    }
+Tool description:
+{tool.get("description", "")}
 
-    store.save_response(run["request"]["runId"], response)
-    return response
+Input schema:
+{json.dumps(schema, indent=2)}
 
+Required argument names:
+{json.dumps(required)}
 
-def propose_effect(store, run, receipt):
-    policy = run["request"]["policy"]
-    effect_tool = policy["effectTools"][0]
-    diagnosis = run["last_response"]["diagnosis"]
+Incident transcript:
+{transcript}
 
-    if effect_tool in policy.get("approvalRequiredFor", []):
-        arguments = {"reason": "confirmed incident"}
+Return only JSON:
+{{
+  "arguments": {{}}
+}}
+"""
 
-        approval = {
-            "approvalId": "approval_" + secrets.token_hex(8),
-            "actionId": "effect_" + secrets.token_hex(8),
-            "toolName": effect_tool,
-            "argumentsDigest": sha256_json(arguments)
-        }
-
-        run["approvals"] = [approval]
-
-        response = {
-            "runId": run["request"]["runId"],
-            "status": "waiting",
-            "diagnosis": diagnosis,
-            "dispatches": [],
-            "approvals": [approval]
-        }
-
-        store.save_response(run["request"]["runId"], response)
-        return response
-
-    effect = {
-        "actionId": "effect_" + secrets.token_hex(8),
-        "callId": "effect_call_" + secrets.token_hex(8),
-        "phase": "effect",
-        "toolName": effect_tool,
-        "arguments": {"reason": "confirmed incident"},
-        "evidence": diagnosis["evidence"][:1],
-        "attempt": 1,
-        "traceparent": make_traceparent()
-    }
-
-    run["dispatches"].append(effect)
-
-    response = {
-        "runId": run["request"]["runId"],
-        "status": "waiting",
-        "diagnosis": diagnosis,
-        "dispatches": [effect],
-        "approvals": []
-    }
-
-    store.save_response(run["request"]["runId"], response)
-    return response
-
-
-def dispatch_approved_effect(store, run, approval, receipt):
-    diagnosis = run["last_response"]["diagnosis"]
-
-    effect = {
-        "actionId": approval["actionId"],
-        "callId": "effect_call_" + secrets.token_hex(8),
-        "phase": "effect",
-        "toolName": approval["toolName"],
-        "arguments": {"reason": "approved incident response"},
-        "evidence": diagnosis["evidence"][:1],
-        "attempt": 1,
-        "approvalId": approval["approvalId"],
-        "approvalNonce": receipt.get("nonce", ""),
-        "traceparent": make_traceparent()
-    }
-
-    run["dispatches"].append(effect)
-
-    response = {
-        "runId": run["request"]["runId"],
-        "status": "waiting",
-        "diagnosis": diagnosis,
-        "dispatches": [effect],
-        "approvals": []
-    }
-
-    store.save_response(run["request"]["runId"], response)
-    return response
-
-
-def finish_run(store, run, receipt):
-    action_log = []
-    receipt_log = []
-
-    for dispatch in run["dispatches"]:
-        action_log.append(dispatch)
-
-        if "receipt" in dispatch:
-            outcome = dispatch["receipt"]
-
-            receipt_log.append({
-                "receiptId": dispatch["receiptId"],
-                "actionId": dispatch["actionId"],
-                "callId": dispatch["callId"],
-                "attempt": dispatch["attempt"],
-                "status": outcome["status"],
-                "resultClass": outcome["resultClass"],
-                "nonce": outcome["nonce"]
-            })
-
-    response = {
-        "runId": run["request"]["runId"],
-        "status": "completed",
-        "diagnosis": run["last_response"]["diagnosis"],
-        "chosenEffect": "scale_service",
-        "suppressed": [],
-        "actionLog": action_log,
-        "receiptLog": receipt_log,
-        "otlp": build_otlp(run)
-    }
-
-    store.save_response(run["request"]["runId"], response)
-    return response
-
-
-def sha256_json(value):
-    encoded = json.dumps(
-        value,
-        sort_keys=True,
-        separators=(",", ":")
-    ).encode()
-
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def make_traceparent():
-    return (
-        "00-"
-        + secrets.token_hex(16)
-        + "-"
-        + secrets.token_hex(8)
-        + "-01"
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": "Return only valid JSON. Use exact values supported by the transcript."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        response_format={"type": "json_object"}
     )
+
+    parsed = json.loads(completion.choices[0].message.content)
+    arguments = parsed.get("arguments", {})
+
+    # Keep only declared properties and ensure required fields exist.
+    cleaned = {}
+    for key, value in arguments.items():
+        if key in properties:
+            cleaned[key] = value
+
+    for key in required:
+        if key not in cleaned:
+            raise ValueError(f"Missing required argument: {key}")
+
+    return cleaned
+
+
+def plan_incident(body):
+    incident = body["incident"]
+    catalog = body["toolCatalog"]
+    policy = body["policy"]
+
+    evidence_ids = extract_evidence_ids(incident["transcript"])
+
+    planning_prompt = f"""
+You are an incident triage planner.
+
+Choose exactly one root cause from allowedRootCauses.
+Cite 2 to 4 evidence IDs that support it.
+Choose 1 to 3 diagnostic tools from the tool catalog.
+For each chosen tool, cite at least one evidence ID.
+
+Return only JSON:
+{{
+  "rootCause": "one value from allowedRootCauses",
+  "evidence": ["id1", "id2"],
+  "diagnostics": [
+    {{
+      "toolName": "exact tool name from catalog",
+      "evidence": ["id1"]
+    }}
+  ]
+}}
+
+allowedRootCauses:
+{json.dumps(incident["allowedRootCauses"])}
+
+Evidence IDs:
+{json.dumps(evidence_ids)}
+
+Tool catalog:
+{json.dumps(catalog)}
+
+Policy:
+{json.dumps(policy)}
+
+Incident:
+{json.dumps(incident)}
+"""
+
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a careful incident diagnosis planner. Return only valid JSON."
+            },
+            {
+                "role": "user",
+                "content": planning_prompt
+            }
+        ],
+        response_format={"type": "json_object"}
+    )
+
+    plan = json.loads(completion.choices[0].message.content)
+
+    root_cause = plan["rootCause"]
+    diagnosis_evidence = plan["evidence"][:4]
+
+    if root_cause not in incident["allowedRootCauses"]:
+        raise ValueError("Model chose an unsupported root cause")
+
+    if not (2 <= len(diagnosis_evidence) <= 4):
+        raise ValueError("Diagnosis must cite 2 to 4 evidence IDs")
+
+    for evidence_id in diagnosis_evidence:
+        if evidence_id not in evidence_ids:
+            raise ValueError(f"Unknown evidence ID: {evidence_id}")
+
+    dispatches = []
+
+    for item in plan.get("diagnostics", [])[:3]:
+        tool_name = item["toolName"]
+
+        tool = next(
+            (t for t in catalog if t["name"] == tool_name),
+            None
+        )
+
+        if tool is None:
+            continue
+
+        cited = [
+            evidence for evidence in item.get("evidence", [])
+            if evidence in diagnosis_evidence
+        ]
+
+        if not cited:
+            cited = [diagnosis_evidence[0]]
+
+        arguments = build_required_arguments(
+            tool,
+            incident["transcript"]
+        )
+
+        trace_id = secrets.token_hex(16)
+        client_span_id = secrets.token_hex(8)
+
+        dispatches.append({
+            "actionId": "diag_" + secrets.token_hex(8),
+            "callId": "call_" + secrets.token_hex(8),
+            "phase": "diagnostic",
+            "toolName": tool_name,
+            "arguments": arguments,
+            "evidence": cited[:1],
+            "attempt": 1,
+            "traceparent": f"00-{trace_id}-{client_span_id}-01"
+        })
+
+    if not dispatches:
+        raise ValueError("No valid diagnostic dispatch was produced")
+
+    return {
+        "runId": body["runId"],
+        "status": "waiting",
+        "diagnosis": {
+            "rootCause": root_cause,
+            "evidence": diagnosis_evidence
+        },
+        "dispatches": dispatches,
+        "approvals": []
+    }
